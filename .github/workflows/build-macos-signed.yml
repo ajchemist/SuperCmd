@@ -80,6 +80,7 @@ jobs:
           set -euo pipefail
           npm run build
           npx electron-builder --mac dmg \
+            --publish never \
             -c.mac.identity="Chief Local Dev" \
             -c.mac.notarize=false \
             -c.mac.hardenedRuntime=false
