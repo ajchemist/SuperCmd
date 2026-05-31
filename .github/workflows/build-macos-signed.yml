@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14   # Apple Silicon (arm64)
+    runs-on: macos-15   # Apple Silicon (arm64), ships Xcode 16 / Swift 6
     timeout-minutes: 90
     steps:
       - name: Checkout ${{ inputs.ref }}
@@ -30,6 +30,14 @@ jobs:
         with:
           node-version: 20
           cache: npm
+
+      - name: Select latest Xcode (native packages need Swift 6)
+        run: |
+          set -euo pipefail
+          XC="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)"
+          echo "Using $XC"
+          sudo xcode-select -s "$XC"
+          swift --version
 
       - name: Compute safe artifact name
         env:
