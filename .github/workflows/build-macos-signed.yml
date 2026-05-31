@@ -65,9 +65,19 @@ jobs:
           # Allow codesign to use the key non-interactively in CI.
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          rm -f "$RUNNER_TEMP/cert.p12"
+          # Keep both the build keychain and the login keychain in the search list.
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          # electron-builder only accepts a "valid" (trusted) identity — raw
+          # codesign doesn't, but app-builder-lib filters with `find-identity -v`.
+          # Trust this self-signed cert for code signing on this ephemeral runner.
+          openssl pkcs12 -in "$RUNNER_TEMP/cert.p12" -clcerts -nokeys \
+            -passin pass:"$MAC_CERT_PASSWORD" -out "$RUNNER_TEMP/cert.pem"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain "$RUNNER_TEMP/cert.pem"
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/cert.pem"
           echo "CSC_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
-          security find-identity -p codesigning "$KEYCHAIN"
+          echo "--- valid code-signing identities (must be >= 1) ---"
+          security find-identity -v -p codesigning "$KEYCHAIN"
 
       - name: Install dependencies
         run: npm ci
