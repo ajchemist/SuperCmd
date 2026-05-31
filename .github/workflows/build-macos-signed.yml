@@ -1,0 +1,85 @@
+name: Build macOS (self-signed)
+
+# Manual builds only. Pick any branch/tag/SHA via the "ref" input.
+# The workflow file itself lives on the default branch (main); the code that
+# gets built is whatever you put in "ref" — so feat/* branches stay clean and
+# never need this file committed into them.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or SHA to build (e.g. feat/window-maximize-width-height)"
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14   # Apple Silicon (arm64)
+    timeout-minutes: 90
+    steps:
+      - name: Checkout ${{ inputs.ref }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Compute safe artifact name
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          SAFE_REF="$(printf '%s' "$REF" | tr '/ :*?"<>|\\' '-')"
+          echo "ARTIFACT_NAME=SuperCmd-macos-$SAFE_REF" >> "$GITHUB_ENV"
+
+      - name: Import self-signed code-signing certificate
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          echo "$MAC_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$MAC_CERT_PASSWORD" -A -T /usr/bin/codesign
+          # Allow codesign to use the key non-interactively in CI.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          rm -f "$RUNNER_TEMP/cert.p12"
+          echo "CSC_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          security find-identity -p codesigning "$KEYCHAIN"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build, sign, and package dmg
+        env:
+          NODE_ENV: production
+          CSC_IDENTITY_AUTO_DISCOVERY: "true"
+        run: |
+          set -euo pipefail
+          npm run build
+          npx electron-builder --mac dmg \
+            -c.mac.identity="Chief Local Dev" \
+            -c.mac.notarize=false \
+            -c.mac.hardenedRuntime=false
+
+      - name: Upload dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: out/*.dmg
+          if-no-files-found: error
+          retention-days: 30
