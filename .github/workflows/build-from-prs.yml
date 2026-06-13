@@ -1,0 +1,174 @@
+name: Build macOS from PR list
+
+# PR 번호 목록을 입력하면 origin/main 위에 각 PR을 cherry-pick한 뒤
+# self-signed DMG를 빌드해 artifact로 업로드합니다.
+# test-build 브랜치를 수동으로 관리하지 않아도 됩니다.
+on:
+  workflow_dispatch:
+    inputs:
+      pr_numbers:
+        description: "포함할 PR 번호 (쉼표 구분, 예: 468,469,470)"
+        required: true
+      upstream_ref:
+        description: "베이스로 쓸 upstream ref (기본: main)"
+        default: main
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout upstream base
+        uses: actions/checkout@v4
+        with:
+          repository: SuperCmdLabs/SuperCmd
+          ref: ${{ inputs.upstream_ref }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Select latest Xcode (Swift 6)
+        run: |
+          set -euo pipefail
+          XC="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)"
+          sudo xcode-select -s "$XC"
+          swift --version
+
+      - name: Apply PRs via cherry-pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_LIST: ${{ inputs.pr_numbers }}
+        run: |
+          set -euo pipefail
+          git config user.email "ci@build"
+          git config user.name "CI Build"
+
+          APPLIED=""
+          FAILED=""
+
+          IFS=',' read -ra PRS <<< "$PR_LIST"
+          for PR in "${PRS[@]}"; do
+            PR="$(echo "$PR" | tr -d ' ')"
+            echo "━━━ PR #$PR 적용 중 ━━━"
+
+            # PR의 head ref를 임시 브랜치로 fetch
+            if ! gh pr checkout "$PR" \
+                --repo SuperCmdLabs/SuperCmd \
+                --branch "__pr-${PR}-tmp" 2>/dev/null; then
+              echo "⚠️  PR #$PR fetch 실패 — 건너뜀"
+              FAILED="$FAILED #$PR"
+              continue
+            fi
+
+            # main 기준으로 새로 추가된 커밋 SHA 목록 (오래된 것 먼저)
+            COMMITS=$(git log main.."__pr-${PR}-tmp" --reverse --format="%H")
+            git checkout main
+
+            if [ -z "$COMMITS" ]; then
+              echo "⚠️  PR #$PR 에 새 커밋 없음 — 건너뜀"
+              git branch -D "__pr-${PR}-tmp" 2>/dev/null || true
+              continue
+            fi
+
+            CHERRY_FAIL=0
+            while IFS= read -r SHA; do
+              if ! git cherry-pick "$SHA"; then
+                echo "❌ cherry-pick 실패: $SHA (PR #$PR)"
+                git cherry-pick --abort 2>/dev/null || true
+                CHERRY_FAIL=1
+                break
+              fi
+            done <<< "$COMMITS"
+
+            git branch -D "__pr-${PR}-tmp" 2>/dev/null || true
+
+            if [ "$CHERRY_FAIL" -eq 1 ]; then
+              echo "⚠️  PR #$PR cherry-pick 실패 — 건너뜀"
+              FAILED="$FAILED #$PR"
+            else
+              echo "✅ PR #$PR 적용 완료"
+              APPLIED="$APPLIED #$PR"
+            fi
+          done
+
+          echo ""
+          echo "━━━ 결과 ━━━"
+          echo "적용됨:  $APPLIED"
+          echo "실패/건너뜀: $FAILED"
+          echo "APPLIED_PRS=$APPLIED" >> "$GITHUB_ENV"
+          echo "FAILED_PRS=$FAILED"  >> "$GITHUB_ENV"
+
+      - name: Compute artifact name
+        run: |
+          SAFE=$(echo "${{ inputs.pr_numbers }}" | tr ', ' '--' | tr -s '-')
+          echo "ARTIFACT_NAME=SuperCmd-macos-prs-${SAFE}-$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: Import self-signed certificate
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          echo "$MAC_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$MAC_CERT_PASSWORD" -A -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          openssl pkcs12 -in "$RUNNER_TEMP/cert.p12" -clcerts -nokeys \
+            -passin pass:"$MAC_CERT_PASSWORD" -out "$RUNNER_TEMP/cert.pem"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain "$RUNNER_TEMP/cert.pem"
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/cert.pem"
+          echo "CSC_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build, sign, and package DMG
+        env:
+          NODE_ENV: production
+          CSC_IDENTITY_AUTO_DISCOVERY: "true"
+        run: |
+          set -euo pipefail
+          npm run build
+          npx electron-builder --mac dmg \
+            --publish never \
+            -c.mac.identity="Chief Local Dev" \
+            -c.mac.notarize=false \
+            -c.mac.hardenedRuntime=false
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: out/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build summary
+        run: |
+          echo "## 빌드 결과" >> "$GITHUB_STEP_SUMMARY"
+          echo "| | |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 베이스 | \`${{ inputs.upstream_ref }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 적용된 PR | \`${{ env.APPLIED_PRS }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 실패/건너뜀 | \`${{ env.FAILED_PRS }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Artifact | \`${{ env.ARTIFACT_NAME }}\` |" >> "$GITHUB_STEP_SUMMARY"

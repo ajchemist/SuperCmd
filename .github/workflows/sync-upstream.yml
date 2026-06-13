@@ -1,0 +1,30 @@
+name: Sync fork/main with upstream
+
+on:
+  schedule:
+    - cron: '0 18 * * *'  # 매일 03:00 KST (UTC 18:00)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork/main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Sync with upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/SuperCmdLabs/SuperCmd.git
+          git fetch upstream main
+          # ff-only: upstream에 diverge가 생기면 실패시켜 수동 확인 유도
+          git merge upstream/main --ff-only
+          git push origin main
+          echo "✅ fork/main synced with upstream/main ($(git rev-parse --short HEAD))"
