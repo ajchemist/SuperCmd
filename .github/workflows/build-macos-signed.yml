@@ -1,14 +1,14 @@
 name: Build macOS (self-signed)
 
-# Manual builds only. Pick any branch/tag/SHA via the "ref" input.
-# The workflow file itself lives on the default branch (main); the code that
-# gets built is whatever you put in "ref" — so feat/* branches stay clean and
-# never need this file committed into them.
+# Triggers automatically on every push to nightly, or manually for any ref.
 on:
+  push:
+    branches:
+      - nightly
   workflow_dispatch:
     inputs:
       ref:
-        description: "Branch, tag, or SHA to build (e.g. feat/window-maximize-width-height)"
+        description: "Branch, tag, or SHA to build (e.g. feat/my-branch)"
         required: true
         default: main
 
@@ -20,10 +20,10 @@ jobs:
     runs-on: macos-15   # Apple Silicon (arm64), ships Xcode 16 / Swift 6
     timeout-minutes: 90
     steps:
-      - name: Checkout ${{ inputs.ref }}
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -39,13 +39,18 @@ jobs:
           sudo xcode-select -s "$XC"
           swift --version
 
-      - name: Compute safe artifact name
+      - name: Compute artifact name
         env:
           REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
-          SAFE_REF="$(printf '%s' "$REF" | tr '/ :*?"<>|\\' '-')"
-          echo "ARTIFACT_NAME=SuperCmd-macos-$SAFE_REF" >> "$GITHUB_ENV"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            SHORT_SHA="${GITHUB_SHA::7}"
+            echo "ARTIFACT_NAME=SuperCmd-macos-nightly-$SHORT_SHA" >> "$GITHUB_ENV"
+          else
+            SAFE_REF="$(printf '%s' "$REF" | tr '/ :*?"<>|\\' '-')"
+            echo "ARTIFACT_NAME=SuperCmd-macos-$SAFE_REF" >> "$GITHUB_ENV"
+          fi
 
       - name: Import self-signed code-signing certificate
         env:
@@ -82,7 +87,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build, sign, and package dmg
+      - name: Build, sign, and package DMG
         env:
           NODE_ENV: production
           CSC_IDENTITY_AUTO_DISCOVERY: "true"
@@ -95,10 +100,10 @@ jobs:
             -c.mac.notarize=false \
             -c.mac.hardenedRuntime=false
 
-      - name: Upload dmg artifact
+      - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: out/*.dmg
           if-no-files-found: error
-          retention-days: 30
+          retention-days: ${{ github.event_name == 'push' && 14 || 30 }}
